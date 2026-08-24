@@ -1,0 +1,117 @@
+"""
+Safety Veins - LSTM Predictive Risk Forecaster
+-------------------------------------------------
+Trains a sequence model that looks at the last N sensor readings and
+predicts whether a DANGEROUS event is likely in the next 10 timesteps
+(i.e. genuine forecasting, not just current-value thresholding).
+
+REQUIREMENTS: this needs TensorFlow, which is not installed in this
+sandbox. Run it on your own machine or Google Colab:
+    pip install tensorflow pandas numpy scikit-learn
+
+Usage:
+    python lstm_forecaster.py
+    (expects mine_sensor_dataset.csv in the same folder - generate it
+    first with generate_dataset.py)
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+FEATURES = ["co_ppm", "ch4_percent", "o2_percent", "temp_c",
+            "humidity_pct", "heart_rate", "spo2_pct"]
+TARGET = "risk_in_next_10_steps"
+SEQ_LEN = 20  # look back 20 timesteps (~10 min at 30s interval) to predict forward
+
+
+def build_sequences(df, seq_len=SEQ_LEN):
+    """Turns per-timestep rows into (sequence, label) pairs, per worker
+    so sequences never cross between different workers' shifts."""
+    X, y = [], []
+    for _, group in df.groupby("worker_id"):
+        group = group.sort_values("timestep").reset_index(drop=True)
+        values = group[FEATURES].values
+        labels = group[TARGET].values
+        for i in range(len(group) - seq_len):
+            X.append(values[i:i + seq_len])
+            y.append(labels[i + seq_len])  # label at the END of the window
+    return np.array(X), np.array(y)
+
+
+def build_model(seq_len, n_features):
+    model = models.Sequential([
+        layers.Input(shape=(seq_len, n_features)),
+        layers.LSTM(64, return_sequences=True),
+        layers.Dropout(0.2),
+        layers.LSTM(32),
+        layers.Dropout(0.2),
+        layers.Dense(16, activation="relu"),
+        layers.Dense(1, activation="sigmoid"),  # probability of danger in next 10 steps
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="binary_crossentropy",
+        metrics=["accuracy", tf.keras.metrics.Precision(name="precision"),
+                 tf.keras.metrics.Recall(name="recall")],
+    )
+    return model
+
+
+def main():
+    df = pd.read_csv("mine_sensor_dataset.csv")
+    print(f"Loaded {len(df)} rows, {df['worker_id'].nunique()} workers")
+
+    X, y = build_sequences(df)
+    print(f"Built {len(X)} sequences of shape {X.shape[1:]}")
+    print(f"Positive rate: {y.mean():.4f}")
+
+    # Scale features (fit only on training data to avoid leakage)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y if y.sum() > 5 else None
+    )
+
+    n_samples, seq_len, n_feat = X_train.shape
+    scaler = StandardScaler()
+    X_train_flat = scaler.fit_transform(X_train.reshape(-1, n_feat)).reshape(n_samples, seq_len, n_feat)
+    X_test_flat = scaler.transform(X_test.reshape(-1, n_feat)).reshape(X_test.shape[0], seq_len, n_feat)
+
+    # Class weighting since hazard events are rare
+    pos = y_train.sum()
+    neg = len(y_train) - pos
+    class_weight = {0: 1.0, 1: max(1.0, neg / max(pos, 1))}
+    print(f"Class weights: {class_weight}")
+
+    model = build_model(seq_len, n_feat)
+    model.summary()
+
+    early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True)
+
+    model.fit(
+        X_train_flat, y_train,
+        validation_split=0.15,
+        epochs=60,
+        batch_size=32,
+        class_weight=class_weight,
+        callbacks=[early_stop],
+        verbose=2,
+    )
+
+    print("\n--- Test set evaluation ---")
+    results = model.evaluate(X_test_flat, y_test, verbose=0)
+    for name, val in zip(model.metrics_names, results):
+        print(f"{name}: {val:.4f}")
+
+    model.save("mine_lstm_forecaster.keras")
+    import joblib
+    joblib.dump(scaler, "lstm_scaler.pkl")
+    print("\nSaved model -> mine_lstm_forecaster.keras")
+    print("Saved scaler -> lstm_scaler.pkl")
+
+
+if __name__ == "__main__":
+    main()
