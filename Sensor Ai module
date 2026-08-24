@@ -1,0 +1,276 @@
+"""
+Safety Veins - AI Sensor Detection Module
+------------------------------------------
+Reads data from all worker/environmental sensors, cleans it, and runs
+threshold + anomaly-based risk detection. Designed to run on an edge
+device (e.g. Raspberry Pi / ESP32 gateway) inside the mine.
+
+Sensor groups covered:
+    - Gas sensors        : CO, CH4 (methane), O2 level
+    - Environment sensors : temperature, humidity
+    - Wearable vitals      : heart rate, SpO2, motion (fall detection)
+
+Replace the `read_*` functions in SensorInterface with real hardware
+driver calls (I2C/UART/ADC reads) when wiring up actual sensors.
+"""
+
+import time
+import random
+import json
+import statistics
+from dataclasses import dataclass, field, asdict
+from collections import deque
+from datetime import datetime
+from enum import Enum
+
+try:
+    import joblib
+    _FUSION_AVAILABLE = True
+except ImportError:
+    _FUSION_AVAILABLE = False
+
+
+# ----------------------------------------------------------------------
+# 1. Risk levels
+# ----------------------------------------------------------------------
+class RiskLevel(Enum):
+    SAFE = "SAFE"
+    WARNING = "WARNING"
+    DANGER = "DANGER"
+    CRITICAL = "CRITICAL"
+
+
+# ----------------------------------------------------------------------
+# 2. Safe operating thresholds (based on common mine safety standards)
+#    Adjust these to match your actual sensor calibration / regulations.
+# ----------------------------------------------------------------------
+THRESHOLDS = {
+    "co_ppm":       {"warning": 35,  "danger": 100, "critical": 200},   # Carbon monoxide
+    "ch4_percent":  {"warning": 1.0, "danger": 2.5, "critical": 5.0},   # Methane (explosive at ~5%)
+    "o2_percent":   {"warning": 19.5, "danger": 18.0, "critical": 16.0, "inverted": True},  # Oxygen (lower = worse)
+    "temp_c":       {"warning": 35,  "danger": 40,  "critical": 45},
+    "humidity_pct": {"warning": 85,  "danger": 90,  "critical": 95},
+    "heart_rate":   {"warning": 120, "danger": 150, "critical": 170},
+    "spo2_pct":     {"warning": 94,  "danger": 90,  "critical": 85, "inverted": True},
+}
+
+
+# ----------------------------------------------------------------------
+# 3. Data model for one reading
+# ----------------------------------------------------------------------
+@dataclass
+class SensorReading:
+    worker_id: str
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    co_ppm: float = 0.0
+    ch4_percent: float = 0.0
+    o2_percent: float = 20.9
+    temp_c: float = 25.0
+    humidity_pct: float = 50.0
+    heart_rate: float = 75.0
+    spo2_pct: float = 98.0
+    fall_detected: bool = False
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# ----------------------------------------------------------------------
+# 4. Sensor interface (swap simulated reads for real hardware calls)
+# ----------------------------------------------------------------------
+class SensorInterface:
+    """Wraps raw sensor reads. Replace each method body with actual
+    driver code (e.g. smbus2 for I2C gas sensors, serial for UART GPS,
+    ADC reads for analog sensors) when integrating real hardware."""
+
+    def __init__(self, simulate: bool = True):
+        self.simulate = simulate
+
+    def read_gas(self):
+        if self.simulate:
+            return {
+                "co_ppm": round(random.gauss(20, 15), 2),
+                "ch4_percent": round(max(0, random.gauss(0.5, 0.6)), 2),
+                "o2_percent": round(random.gauss(20.9, 0.8), 2),
+            }
+        # TODO: real I2C/ADC gas sensor reads go here
+        raise NotImplementedError
+
+    def read_environment(self):
+        if self.simulate:
+            return {
+                "temp_c": round(random.gauss(28, 5), 2),
+                "humidity_pct": round(random.gauss(60, 15), 2),
+            }
+        raise NotImplementedError
+
+    def read_vitals(self):
+        if self.simulate:
+            return {
+                "heart_rate": round(random.gauss(85, 20), 1),
+                "spo2_pct": round(random.gauss(97, 2), 1),
+                "fall_detected": random.random() < 0.02,  # 2% chance per read
+            }
+        raise NotImplementedError
+
+    def read_all(self, worker_id: str) -> SensorReading:
+        gas = self.read_gas()
+        env = self.read_environment()
+        vit = self.read_vitals()
+        return SensorReading(worker_id=worker_id, **gas, **env, **vit)
+
+
+# ----------------------------------------------------------------------
+# 5. AI / anomaly detection engine
+# ----------------------------------------------------------------------
+class RiskDetector:
+    """Combines threshold checks with rolling-window trend detection
+    (simple z-score anomaly detection) so danger is flagged BEFORE a
+    hard limit is crossed, not just after."""
+
+    def __init__(self, window_size: int = 10, z_threshold: float = 2.5):
+        self.window_size = window_size
+        self.z_threshold = z_threshold
+        self.history = {}  # worker_id -> {field: deque of values}
+
+    def _get_history(self, worker_id, field_name):
+        self.history.setdefault(worker_id, {})
+        self.history[worker_id].setdefault(field_name, deque(maxlen=self.window_size))
+        return self.history[worker_id][field_name]
+
+    @staticmethod
+    def _level_for(value, rules):
+        inverted = rules.get("inverted", False)
+        checks = [(RiskLevel.CRITICAL, rules["critical"]),
+                  (RiskLevel.DANGER, rules["danger"]),
+                  (RiskLevel.WARNING, rules["warning"])]
+        for level, limit in checks:
+            if (inverted and value <= limit) or (not inverted and value >= limit):
+                return level
+        return RiskLevel.SAFE
+
+    def _trend_anomaly(self, worker_id, field_name, value):
+        """Flags a WARNING if the latest value deviates sharply from
+        this worker's recent rolling average (z-score based)."""
+        hist = self._get_history(worker_id, field_name)
+        anomaly = False
+        if len(hist) >= 5:
+            mean = statistics.mean(hist)
+            stdev = statistics.pstdev(hist) or 0.01
+            z = abs(value - mean) / stdev
+            anomaly = z > self.z_threshold
+        hist.append(value)
+        return anomaly
+
+    def evaluate(self, reading: SensorReading) -> dict:
+        results = {}
+        worst = RiskLevel.SAFE
+        order = [RiskLevel.SAFE, RiskLevel.WARNING, RiskLevel.DANGER, RiskLevel.CRITICAL]
+
+        for field_name, rules in THRESHOLDS.items():
+            value = getattr(reading, field_name)
+            level = self._level_for(value, rules)
+            anomaly = self._trend_anomaly(reading.worker_id, field_name, value)
+            if anomaly and level == RiskLevel.SAFE:
+                level = RiskLevel.WARNING  # trending badly even if under hard limit
+
+            results[field_name] = {"value": value, "level": level.value, "trend_anomaly": anomaly}
+            if order.index(level) > order.index(worst):
+                worst = level
+
+        if reading.fall_detected:
+            worst = RiskLevel.CRITICAL
+            results["fall_detected"] = {"value": True, "level": "CRITICAL", "trend_anomaly": False}
+
+        return {
+            "worker_id": reading.worker_id,
+            "timestamp": reading.timestamp,
+            "overall_risk": worst.value,
+            "details": results,
+        }
+
+
+# ----------------------------------------------------------------------
+# 6. Main monitoring loop
+# ----------------------------------------------------------------------
+class SafetyMonitor:
+    def __init__(self, worker_ids, simulate=True, poll_interval=2.0,
+                 fusion_model_path=None, fusion_features_path=None):
+        self.worker_ids = worker_ids
+        self.sensors = SensorInterface(simulate=simulate)
+        self.detector = RiskDetector()
+        self.poll_interval = poll_interval
+        self.log = []
+
+        # Optional: load the trained fusion model (see fusion_classifier.py)
+        self.fusion_model = None
+        self.fusion_features = None
+        if fusion_model_path and _FUSION_AVAILABLE:
+            try:
+                self.fusion_model = joblib.load(fusion_model_path)
+                self.fusion_features = joblib.load(fusion_features_path)
+                print(f"Loaded fusion model from {fusion_model_path}")
+            except FileNotFoundError:
+                print(f"No fusion model found at {fusion_model_path} - "
+                      f"run fusion_classifier.py first. Continuing without it.")
+
+    def _fusion_score(self, reading: SensorReading) -> float:
+        """Runs the trained sensor-fusion model on this reading, if loaded.
+        Returns None if no model is available."""
+        if not self.fusion_model:
+            return None
+        row = {c: getattr(reading, c, 0.0) if hasattr(reading, c) else 0.0
+               for c in self.fusion_features}
+        import pandas as pd
+        X = pd.DataFrame([row])
+        return float(self.fusion_model.predict_proba(X)[0, 1])
+
+    def poll_once(self):
+        reports = []
+        for wid in self.worker_ids:
+            reading = self.sensors.read_all(wid)
+            report = self.detector.evaluate(reading)
+            fusion_prob = self._fusion_score(reading)
+            if fusion_prob is not None:
+                report["fusion_risk_probability"] = round(fusion_prob, 3)
+            reports.append(report)
+            self.log.append(report)
+            self._handle_alert(report)
+        return reports
+
+    def _handle_alert(self, report):
+        if report["overall_risk"] in ("DANGER", "CRITICAL"):
+            print(f"[ALERT-{report['overall_risk']}] Worker {report['worker_id']} "
+                  f"at {report['timestamp']} -> {self._summarize(report)}")
+
+    @staticmethod
+    def _summarize(report):
+        bad = [f"{k}={v['value']}" for k, v in report["details"].items()
+               if v["level"] in ("DANGER", "CRITICAL")]
+        return ", ".join(bad) if bad else "trend anomaly detected"
+
+    def run(self, cycles: int = 10):
+        for i in range(cycles):
+            print(f"\n--- Poll cycle {i+1}/{cycles} ---")
+            reports = self.poll_once()
+            for r in reports:
+                print(f"{r['worker_id']}: {r['overall_risk']}")
+            time.sleep(self.poll_interval if not self._is_test() else 0)
+
+    @staticmethod
+    def _is_test():
+        return True  # set False to actually sleep between polls in deployment
+
+    def export_log(self, path="sensor_log.json"):
+        with open(path, "w") as f:
+            json.dump(self.log, f, indent=2)
+        print(f"Log exported to {path}")
+
+
+# ----------------------------------------------------------------------
+# 7. Run standalone for testing
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    monitor = SafetyMonitor(worker_ids=["W001", "W002", "W003"], simulate=True)
+    monitor.run(cycles=8)
+    monitor.export_log("/home/claude/safety_veins/sensor_log.json")
