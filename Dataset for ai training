@@ -1,0 +1,134 @@
+"""
+Safety Veins - Synthetic Sensor Dataset Generator
+---------------------------------------------------
+Generates realistic TIME-SERIES sensor data for training the predictive
+models (LSTM forecaster + fusion risk classifier).
+
+Unlike plain random noise, this simulates real-world patterns:
+  - Normal steady-state operation (small fluctuations)
+  - Gradual gas buildup events (exponential/linear rise before venting)
+  - Sudden spike events (equipment failure, blast residue)
+  - Heat/humidity drift over a shift
+  - Occasional fall/vitals-crash events
+
+Output: a CSV with one row per (worker, timestep), ready for both
+LSTM sequence training and tabular classifier training.
+"""
+
+import numpy as np
+import pandas as pd
+import random
+
+random.seed(42)
+np.random.seed(42)
+
+FEATURES = ["co_ppm", "ch4_percent", "o2_percent", "temp_c", "humidity_pct",
+            "heart_rate", "spo2_pct"]
+
+
+def _normal_walk(n, start, drift_std, floor=None, ceil=None):
+    """Random walk around a baseline - simulates steady-state sensor noise."""
+    vals = [start]
+    for _ in range(n - 1):
+        nxt = vals[-1] + np.random.normal(0, drift_std)
+        if floor is not None:
+            nxt = max(floor, nxt)
+        if ceil is not None:
+            nxt = min(ceil, nxt)
+        vals.append(nxt)
+    return np.array(vals)
+
+
+def _inject_buildup_event(series, start_idx, length, peak_multiplier):
+    """Simulates gradual gas buildup: slow exponential rise then decay
+    (e.g. ventilation kicking in or event clearing)."""
+    n = len(series)
+    end_idx = min(n, start_idx + length)
+    rise_len = (end_idx - start_idx) // 2
+    fall_len = (end_idx - start_idx) - rise_len
+
+    base = series[start_idx]
+    rise = base * (1 + peak_multiplier * (1 - np.exp(-np.linspace(0, 3, rise_len))))
+    fall = rise[-1] * np.exp(-np.linspace(0, 2, fall_len)) + base * (1 - np.exp(-np.linspace(0, 2, fall_len)))
+
+    series[start_idx:start_idx + rise_len] = rise
+    series[start_idx + rise_len:end_idx] = fall
+    return series
+
+
+def generate_worker_shift(worker_id, n_steps=720, event_prob=0.15):
+    """Generates one worker's full shift (n_steps readings, e.g. 720 = 6hrs at 30s interval)."""
+
+    co = _normal_walk(n_steps, start=15, drift_std=1.0, floor=0)
+    ch4 = _normal_walk(n_steps, start=0.3, drift_std=0.05, floor=0)
+    o2 = _normal_walk(n_steps, start=20.9, drift_std=0.05, floor=15, ceil=21)
+    temp = _normal_walk(n_steps, start=27, drift_std=0.3, floor=15, ceil=50)
+    humidity = _normal_walk(n_steps, start=55, drift_std=1.0, floor=20, ceil=100)
+    hr = _normal_walk(n_steps, start=80, drift_std=2.0, floor=50, ceil=200)
+    spo2 = _normal_walk(n_steps, start=98, drift_std=0.3, floor=70, ceil=100)
+
+    fall_events = np.zeros(n_steps, dtype=int)
+    label_risk_in_5min = np.zeros(n_steps, dtype=int)  # target: will danger occur in next 10 steps?
+
+    # Randomly inject hazard events
+    n_events = np.random.poisson(event_prob * n_steps / 100)
+    event_starts = sorted(random.sample(range(0, max(1, n_steps - 60)), min(n_events, max(1, n_steps // 60))))
+
+    for start in event_starts:
+        length = random.randint(20, 60)
+        kind = random.choice(["gas_buildup", "o2_drop", "heat_spike", "fall"])
+
+        if kind == "gas_buildup":
+            co = _inject_buildup_event(co, start, length, peak_multiplier=random.uniform(4, 12))
+            ch4 = _inject_buildup_event(ch4, start, length, peak_multiplier=random.uniform(3, 10))
+        elif kind == "o2_drop":
+            drop = np.linspace(0, random.uniform(3, 6), length // 2)
+            recover = drop[::-1]
+            seq = np.concatenate([drop, recover])[:min(length, n_steps - start)]
+            o2[start:start + len(seq)] -= seq
+        elif kind == "heat_spike":
+            temp = _inject_buildup_event(temp, start, length, peak_multiplier=random.uniform(0.3, 0.7))
+        elif kind == "fall":
+            fall_idx = start + length // 2
+            if fall_idx < n_steps:
+                fall_events[fall_idx] = 1
+                hr[fall_idx:fall_idx + 10] += random.uniform(30, 60)
+                spo2[fall_idx:fall_idx + 10] -= random.uniform(5, 15)
+
+        # Label: mark "danger approaching" for the 10 steps BEFORE any hazardous point
+        # (this is what the LSTM will learn to forecast)
+        danger_point = start + length // 2
+        for lag in range(1, 11):
+            idx = danger_point - lag
+            if 0 <= idx < n_steps:
+                label_risk_in_5min[idx] = 1
+
+    df = pd.DataFrame({
+        "worker_id": worker_id,
+        "timestep": np.arange(n_steps),
+        "co_ppm": np.round(co, 2),
+        "ch4_percent": np.round(np.clip(ch4, 0, None), 3),
+        "o2_percent": np.round(o2, 2),
+        "temp_c": np.round(temp, 2),
+        "humidity_pct": np.round(np.clip(humidity, 0, 100), 2),
+        "heart_rate": np.round(np.clip(hr, 40, 220), 1),
+        "spo2_pct": np.round(np.clip(spo2, 60, 100), 1),
+        "fall_detected": fall_events,
+        "risk_in_next_10_steps": label_risk_in_5min,
+    })
+    return df
+
+
+def generate_dataset(n_workers=12, n_steps=720, out_path="mine_sensor_dataset.csv"):
+    all_dfs = [generate_worker_shift(f"W{str(i).zfill(3)}", n_steps=n_steps) for i in range(1, n_workers + 1)]
+    full = pd.concat(all_dfs, ignore_index=True)
+    full.to_csv(out_path, index=False)
+    print(f"Generated {len(full)} rows across {n_workers} workers -> {out_path}")
+    print(f"Positive risk labels: {full['risk_in_next_10_steps'].sum()} "
+          f"({100 * full['risk_in_next_10_steps'].mean():.1f}%)")
+    print(f"Fall events: {full['fall_detected'].sum()}")
+    return full
+
+
+if __name__ == "__main__":
+    generate_dataset(n_workers=12, n_steps=720, out_path="/home/claude/safety_veins/mine_sensor_dataset.csv")
