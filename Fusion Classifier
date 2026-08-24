@@ -1,0 +1,104 @@
+"""
+Safety Veins - Sensor Fusion Risk Classifier
+-----------------------------------------------
+Combines all sensor readings into ONE fused risk probability, instead
+of "whichever single sensor is worst wins" (the limitation of the pure
+threshold approach). Uses gradient boosting so it also works fully
+offline on a Raspberry Pi-class edge device (no TensorFlow needed).
+
+This is a good pairing with the LSTM forecaster:
+    - LSTM (lstm_forecaster.py)      -> "is danger likely in the next N minutes?"
+    - This fusion model (this file)  -> "how risky is THIS exact moment, combining
+                                          all sensors at once?"
+
+Run:
+    python fusion_classifier.py
+(expects mine_sensor_dataset.csv - generate it first with generate_dataset.py)
+"""
+
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+
+FEATURES = ["co_ppm", "ch4_percent", "o2_percent", "temp_c",
+            "humidity_pct", "heart_rate", "spo2_pct"]
+TARGET = "risk_in_next_10_steps"
+
+
+def engineer_features(df):
+    """Adds short-term rate-of-change features per worker - these help
+    the model catch a value that's RISING fast, not just one that's
+    already high (this is what makes it 'predictive' rather than reactive)."""
+    df = df.sort_values(["worker_id", "timestep"]).copy()
+    for col in FEATURES:
+        df[f"{col}_delta"] = df.groupby("worker_id")[col].diff().fillna(0)
+        df[f"{col}_roll_mean"] = (
+            df.groupby("worker_id")[col]
+            .transform(lambda s: s.rolling(5, min_periods=1).mean())
+        )
+    return df
+
+
+def train():
+    df = pd.read_csv("mine_sensor_dataset.csv")
+    df = engineer_features(df)
+
+    feature_cols = FEATURES + [f"{c}_delta" for c in FEATURES] + [f"{c}_roll_mean" for c in FEATURES]
+    X = df[feature_cols]
+    y = df[TARGET]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    model = GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=3,
+        learning_rate=0.05,
+        random_state=42,
+    )
+    model.fit(X_train, y_train)
+
+    probs = model.predict_proba(X_test)[:, 1]
+    preds = model.predict(X_test)
+
+    print("=== Fusion Classifier Evaluation ===")
+    print(classification_report(y_test, preds, zero_division=0))
+    if y_test.nunique() > 1:
+        print(f"ROC-AUC: {roc_auc_score(y_test, probs):.4f}")
+    print("Confusion matrix:\n", confusion_matrix(y_test, preds))
+
+    print("\nTop 10 most important features:")
+    importances = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+    print(importances.head(10))
+
+    joblib.dump(model, "fusion_risk_model.pkl")
+    joblib.dump(feature_cols, "fusion_feature_cols.pkl")
+    print("\nSaved model -> fusion_risk_model.pkl")
+    return model, feature_cols
+
+
+def score_live_reading(model, feature_cols, latest_row: dict):
+    """Score a single live sensor reading (dict of feature -> value).
+    In production, maintain a small rolling buffer per worker to
+    compute the _delta and _roll_mean fields shown here as 0 defaults."""
+    row = {c: latest_row.get(c, 0.0) for c in feature_cols}
+    X = pd.DataFrame([row])
+    prob = model.predict_proba(X)[0, 1]
+    return float(prob)
+
+
+if __name__ == "__main__":
+    model, feature_cols = train()
+
+    # Demo: score one example reading
+    example = {
+        "co_ppm": 85, "ch4_percent": 2.1, "o2_percent": 19.0,
+        "temp_c": 33, "humidity_pct": 70, "heart_rate": 95, "spo2_pct": 96,
+        "co_ppm_delta": 15, "ch4_percent_delta": 0.4,
+    }
+    prob = score_live_reading(model, feature_cols, example)
+    print(f"\nExample live reading fused risk probability: {prob:.3f}")
