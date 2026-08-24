@@ -1,0 +1,65 @@
+# Safety Veins - AI Module
+
+Four files, three layers, working together:
+
+## 1. `generate_dataset.py` — synthetic training data
+Generates realistic mine sensor time-series (gas buildup curves, O2 drops,
+heat spikes, fall events) — NOT random noise. Run this first:
+```
+python generate_dataset.py
+```
+Produces `mine_sensor_dataset.csv`.
+
+## 2. `fusion_classifier.py` — sensor fusion risk model (scikit-learn)
+Combines ALL sensors into one risk probability instead of judging each
+sensor alone. Works fully offline on a Raspberry Pi — no GPU needed.
+```
+pip install pandas numpy scikit-learn joblib
+python fusion_classifier.py
+```
+Produces `fusion_risk_model.pkl` (~0.98 ROC-AUC on the synthetic set).
+
+## 3. `lstm_forecaster.py` — predictive forecasting model (TensorFlow)
+Looks at the last ~10 minutes of readings and predicts whether danger is
+likely in the NEXT 10 minutes — genuine forecasting, not reaction.
+Needs TensorFlow, which isn't in this sandbox — run on your own machine
+or Google Colab:
+```
+pip install tensorflow pandas numpy scikit-learn joblib
+python lstm_forecaster.py
+```
+Produces `mine_lstm_forecaster.keras` + `lstm_scaler.pkl`.
+
+## 4. `sensor_ai_module.py` — the edge runtime
+This is what actually runs on the helmet/gateway hardware in real time.
+It does fast threshold + trend-anomaly checks on every poll (works even
+if the fusion/LSTM models aren't loaded), and if you pass in the trained
+fusion model, it adds a fused risk probability to every report:
+```python
+monitor = SafetyMonitor(
+    worker_ids=["W001", "W002", "W003"],
+    simulate=True,  # set False + fill in real sensor drivers for hardware
+    fusion_model_path="fusion_risk_model.pkl",
+    fusion_features_path="fusion_feature_cols.pkl",
+)
+monitor.run(cycles=10)
+```
+
+## Recommended story for your SIH presentation
+- **Edge layer** (`sensor_ai_module.py`): instant threshold alerts, works
+  even fully offline underground with zero network.
+- **Fusion layer** (`fusion_classifier.py`): combines all sensors into one
+  confidence score instead of "worst sensor wins" — runs on the same
+  low-power edge hardware.
+- **Forecasting layer** (`lstm_forecaster.py`): the genuinely "predictive"
+  piece — trained on time-series patterns to warn before a hard limit is
+  crossed, run periodically at a gateway/surface station with more compute.
+
+## Still needed before this is deployment-ready
+- Swap the `SensorInterface` simulated reads for real hardware drivers once you
+  know your exact sensor part numbers (I2C addresses, ADC pins, etc.)
+- Replace/retrain on real mine sensor data if you can source or collect any —
+  synthetic data gets you a working demo, not validated real-world accuracy
+- Add worker localization (RSSI/UWB) as another fused input
+- Load-test the LSTM inference time on your actual edge hardware (Pi/ESP32)
+  to confirm it's fast enough to run alongside the real-time threshold checks
