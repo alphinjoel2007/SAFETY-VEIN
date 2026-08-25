@@ -1,0 +1,43 @@
+"""
+Simple blackbox logger: appends JSON lines or CSV into a rotating log on the SD.
+"""
+import os
+import csv
+import time
+import json
+from pathlib import Path
+
+class Blackbox:
+    def __init__(self, path='blackbox_logs', max_mb=10, keep_files=7):
+        self.base = Path(path)
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_mb * 1024 * 1024
+        self.keep_files = keep_files
+        self.curr = self.base / f"log_{time.strftime('%Y%m%d')}.csv"
+        if not self.curr.exists():
+            with open(self.curr, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ts','level','score','gps_lat','gps_lon','raw','reason'])
+    def _rotate(self):
+        if self.curr.exists() and self.curr.stat().st_size > self.max_bytes:
+            # rotate by adding suffix timestamp
+            suffix = time.strftime('%Y%m%d_%H%M%S')
+            new = self.base / f"log_{time.strftime('%Y%m%d')}_{suffix}.csv"
+            self.curr.rename(new)
+            self.curr = self.base / f"log_{time.strftime('%Y%m%d')}.csv"
+            with open(self.curr, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ts','level','score','gps_lat','gps_lon','raw','reason'])
+            # cleanup old files
+            logs = sorted(self.base.glob('log_*.csv'))
+            if len(logs) > self.keep_files:
+                for old in logs[:-self.keep_files]:
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+    def append(self, level, score, raw_features, gps_lat=None, gps_lon=None, reason=''):
+        self._rotate()
+        with open(self.curr, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([int(time.time()), level, score, gps_lat, gps_lon, json.dumps(raw_features), reason])
