@@ -18,12 +18,12 @@ void loop() {
   Serial.print("Potentiometer Value: ");
   Serial.println(potValue);
 
-  // Turn all LEDs OFF
+
   digitalWrite(greenPin, LOW);
   digitalWrite(yellowPin, LOW);
   digitalWrite(redPin, LOW);
 
-  // Select LED according to potentiometer value
+  
   int selectedPin;
 
   if (potValue <= 819) {
@@ -36,7 +36,7 @@ void loop() {
     selectedPin = redPin;
   }
 
-  // Blink selected LED
+  
   digitalWrite(selectedPin, HIGH);
   delay(500);
 
