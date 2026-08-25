@@ -1,0 +1,121 @@
+"""
+Drivers + feature extraction for multiple sensors.
+Adapt pin numbers and I2C addresses to your wiring.
+"""
+import time
+import json
+import math
+import numpy as np
+
+# Optional imports. Wrap in try for easier testing on non-hardware machines.
+try:
+    import Adafruit_DHT
+except Exception:
+    Adafruit_DHT = None
+
+try:
+    import smbus2
+except Exception:
+    smbus2 = None
+
+try:
+    import RPi.GPIO as GPIO
+except Exception:
+    GPIO = None
+
+try:
+    import serial  # for GPS
+except Exception:
+    serial = None
+
+# MPU6050 class: simple I2C read to compute short-term RMS for microseismic
+class MPU6050:
+    def __init__(self, bus=1, addr=0x68):
+        if smbus2 is None:
+            raise RuntimeError("smbus2 required for MPU6050")
+        self.bus = smbus2.SMBus(bus)
+        self.addr = addr
+        # wake up sensor
+        self.bus.write_byte_data(self.addr, 0x6B, 0)
+    def read_accel(self):
+        # read raw accel registers
+        def read_word(reg):
+            hi = self.bus.read_byte_data(self.addr, reg)
+            lo = self.bus.read_byte_data(self.addr, reg+1)
+            val = (hi << 8) | lo
+            if val >= 0x8000:
+                val = -((65535) - val + 1)
+            return val
+        ax = read_word(0x3B) / 16384.0
+        ay = read_word(0x3D) / 16384.0
+        az = read_word(0x3F) / 16384.0
+        return ax, ay, az
+
+# Example read functions (simulate when hardware not present)
+def read_dht(pin=4):
+    if Adafruit_DHT is None:
+        return {'temperature': 25.0, 'humidity': 50.0}
+    h, t = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, pin)
+    return {'temperature': float(t), 'humidity': float(h)}
+
+def read_mq_values(analog_reader):
+    # placeholder: MQ sensor analog reading function provided by caller
+    # expect analog_reader(pin) -> voltage or raw ADC
+    return {
+        'mq4': analog_reader('mq4_pin'),
+        'mq7': analog_reader('mq7_pin'),
+        'mq136': analog_reader('mq136_pin')
+    }
+
+def compute_accel_rms(mpu, samples=50, delay=0.01):
+    vals = []
+    for _ in range(samples):
+        ax, ay, az = mpu.read_accel()
+        # remove gravity bias for small vibrations: subtract 1g on Z if needed
+        g = 1.0
+        mag = math.sqrt(ax*ax + ay*ay + (az - g)**2)
+        vals.append(mag)
+        time.sleep(delay)
+    arr = np.array(vals)
+    return float(np.sqrt(np.mean(arr**2)))
+
+def read_gps(serial_port="/dev/ttyS0"):
+    if serial is None:
+        return {'lat': None, 'lon': None}
+    try:
+        ser = serial.Serial(serial_port, baudrate=9600, timeout=1)
+        line = ser.readline().decode('ascii', errors='ignore')
+        # Very simple: search for GPGGA or GPRMC parse. Use pynmea2 for robust parsing.
+        if 'GPGGA' in line or 'GPRMC' in line:
+            # placeholder parsing; for production use pynmea2
+            return {'lat': None, 'lon': None}
+    except Exception:
+        return {'lat': None, 'lon': None}
+    return {'lat': None, 'lon': None}
+
+# Example analog_reader that returns simulated ADC values (0..1023)
+def analog_reader_sim(pin):
+    # return values keyed by names for simulated behavior
+    mapping = {'mq4_pin': 120, 'mq7_pin': 90, 'mq136_pin': 40}
+    return mapping.get(pin, 0)
+
+# Build a single feature vector from current sensor reads
+def build_feature_vector(dht_pin, mpu, analog_reader=analog_reader_sim):
+    d = read_dht(dht_pin)
+    mq = read_mq_values(analog_reader)
+    accel_rms = compute_accel_rms(mpu) if mpu else 0.0
+    # Optional heart/spo2 readings from MAX30102 would be added here using its driver
+    # For now use placeholders:
+    hr = 70.0
+    spo2 = 98.0
+    features = {
+        'temperature': d['temperature'],
+        'humidity': d['humidity'],
+        'mq4': float(mq['mq4']),
+        'mq7': float(mq['mq7']),
+        'mq136': float(mq['mq136']),
+        'accel_rms': float(accel_rms),
+        'hr': float(hr),
+        'spo2': float(spo2)
+    }
+    return features
