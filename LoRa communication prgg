@@ -1,0 +1,52 @@
+"""
+Simple LoRa send wrapper.
+This uses the 'sx127x' Python library as an example. Replace with the exact library
+you install for your hardware (or implement SPI calls).
+"""
+import time
+import json
+
+# Import depends on library. This is a placeholder.
+try:
+    from sx127x.sx127x import SX127x
+    from sx127x.board_config import BOARD
+    HAS_LORA = True
+except Exception:
+    SX127x = None
+    BOARD = None
+    HAS_LORA = False
+
+class LoRaComm:
+    def __init__(self, dev_id='dev01', channel=1):
+        self.dev_id = dev_id
+        if not HAS_LORA:
+            print("Warning: LoRa library not available; lora send() will be no-op")
+            self.lora = None
+            return
+        BOARD.setup()
+        self.lora = SX127x()
+        # configure frequency etc here
+        # self.lora.set_freq(915)  # adjust region: 433/868/915
+    def send(self, level, reason, lat=None, lon=None, score=None, retries=3):
+        payload = {
+            'id': self.dev_id,
+            'ts': int(time.time()),
+            'lvl': level,
+            'reason': reason[:80],
+            'lat': lat,
+            'lon': lon,
+            'score': score
+        }
+        data = json.dumps(payload, separators=(',',':'))
+        if not self.lora:
+            print("LoRa send (simulated):", data)
+            return True
+        for attempt in range(retries):
+            try:
+                self.lora.write_payload(list(data.encode('utf-8')))
+                # optionally wait for ack or delay
+                return True
+            except Exception as e:
+                print("LoRa send error attempt", attempt, e)
+                time.sleep(1 + attempt)
+        return False
