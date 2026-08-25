@@ -1,0 +1,116 @@
+module safety_vein (
+    input wire clk,
+    input wire rst,
+    input wire [11:0] methane,
+    input wire [11:0] co,
+    input wire [11:0] h2s,
+    input wire [11:0] temperature,
+    input wire [11:0] humidity,
+    input wire fall_detected,
+    input wire impact_detected,
+    input wire vital_abnormal,
+    input wire sos_button,
+    output reg [1:0] risk_level,
+    output reg warning,
+    output reg emergency,
+    output reg blackbox_trigger,
+    output reg [2:0] hazard_type
+);
+
+    localparam NORMAL = 2'b00;
+    localparam CAUTION = 2'b01;
+    localparam HIGH_RISK = 2'b10;
+    localparam CRITICAL = 2'b11;
+
+    localparam NO_HAZARD = 3'b000;
+    localparam GAS_HAZARD = 3'b001;
+    localparam TEMP_HAZARD = 3'b010;
+    localparam FALL_HAZARD = 3'b011;
+    localparam VITAL_HAZARD = 3'b100;
+    localparam SOS_HAZARD = 3'b101;
+
+    parameter [11:0] METHANE_CAUTION = 12'd500;
+    parameter [11:0] METHANE_HIGH = 12'd700;
+    parameter [11:0] METHANE_CRITICAL = 12'd900;
+
+    parameter [11:0] CO_CAUTION = 12'd400;
+    parameter [11:0] CO_HIGH = 12'd600;
+    parameter [11:0] CO_CRITICAL = 12'd800;
+
+    parameter [11:0] H2S_CAUTION = 12'd100;
+    parameter [11:0] H2S_HIGH = 12'd200;
+    parameter [11:0] H2S_CRITICAL = 12'd300;
+
+    parameter [11:0] TEMP_HIGH = 12'd600;
+    parameter [11:0] TEMP_CRITICAL = 12'd800;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            risk_level <= NORMAL;
+            warning <= 1'b0;
+            emergency <= 1'b0;
+            blackbox_trigger <= 1'b0;
+            hazard_type <= NO_HAZARD;
+        end
+        else begin
+            warning <= 1'b0;
+            emergency <= 1'b0;
+            blackbox_trigger <= 1'b0;
+            hazard_type <= NO_HAZARD;
+
+            if (sos_button) begin
+                risk_level <= CRITICAL;
+                emergency <= 1'b1;
+                warning <= 1'b1;
+                blackbox_trigger <= 1'b1;
+                hazard_type <= SOS_HAZARD;
+            end
+            else if ((methane >= METHANE_CRITICAL) ||
+                     (co >= CO_CRITICAL) ||
+                     (h2s >= H2S_CRITICAL) ||
+                     (temperature >= TEMP_CRITICAL) ||
+                     fall_detected ||
+                     impact_detected ||
+                     vital_abnormal) begin
+
+                risk_level <= CRITICAL;
+                emergency <= 1'b1;
+                warning <= 1'b1;
+                blackbox_trigger <= 1'b1;
+
+                if (fall_detected || impact_detected)
+                    hazard_type <= FALL_HAZARD;
+                else if (vital_abnormal)
+                    hazard_type <= VITAL_HAZARD;
+                else
+                    hazard_type <= GAS_HAZARD;
+            end
+            else if ((methane >= METHANE_HIGH) ||
+                     (co >= CO_HIGH) ||
+                     (h2s >= H2S_HIGH) ||
+                     (temperature >= TEMP_HIGH)) begin
+
+                risk_level <= HIGH_RISK;
+                warning <= 1'b1;
+                blackbox_trigger <= 1'b1;
+                hazard_type <= GAS_HAZARD;
+            end
+            else if ((methane >= METHANE_CAUTION) ||
+                     (co >= CO_CAUTION) ||
+                     (h2s >= H2S_CAUTION) ||
+                     (temperature >= TEMP_HIGH - 12'd100)) begin
+
+                risk_level <= CAUTION;
+                warning <= 1'b1;
+                hazard_type <= GAS_HAZARD;
+            end
+            else begin
+                risk_level <= NORMAL;
+                warning <= 1'b0;
+                emergency <= 1'b0;
+                hazard_type <= NO_HAZARD;
+            end
+        end
+    end
+
+endmodule
