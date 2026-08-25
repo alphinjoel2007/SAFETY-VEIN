@@ -1,0 +1,176 @@
+"""
+Main loop: reads sensors, applies rules and model, logs to blackbox, buzzes & sends LoRa.
+Run: python3 monitor.py --model model.joblib
+"""
+import time
+import argparse
+import joblib
+import numpy as np
+import RPi.GPIO as GPIO
+from sensors import MPU6050, build_feature_vector, analog_reader_sim
+from lora_comm import LoRaComm
+from blackbox import Blackbox
+
+# GPIO pins
+BUZZER_PIN = 17
+SOS_BUTTON_PIN = 27
+OLED_PRESENT = False  # add OLED driver if available
+
+# Thresholds for immediate rules (example, tune for your sensors)
+THR = {
+    'mq4_critical': 300,    # adjust to ADC units or ppm after calibration
+    'mq7_critical': 250,
+    'mq136_critical': 200,
+    'accel_spike': 0.05,    # RMS g units for microseismic spike
+    'temp_high': 60.0,
+    'temp_low': -10.0
+}
+
+# Map model decision_function to levels (IsolationForest higher => normal)
+# We'll use decision_function value: normal ~> larger; anomalies -> negative
+MAPPING = {
+    'safe': 0.2,    # any score >= 0.2 -> SAFE
+    'caution': 0.0, # 0.0 <= score < 0.2 -> CAUTION
+    'highrisk': -0.3, # -0.3 <= score < 0.0 -> HIGHRISK
+    'critical': -1.0  # score < -0.3 -> CRITICAL
+}
+
+def map_score_to_level(score):
+    if score >= MAPPING['safe']:
+        return 'SAFE'
+    if score >= MAPPING['caution']:
+        return 'CAUTION'
+    if score >= MAPPING['highrisk']:
+        return 'HIGHRISK'
+    return 'CRITICAL'
+
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(BUZZER_PIN, GPIO.OUT)
+    GPIO.setup(SOS_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+def beep(pattern='short'):
+    if pattern == 'short':
+        GPIO.output(BUZZER_PIN, True); time.sleep(0.08); GPIO.output(BUZZER_PIN, False)
+    elif pattern == 'long':
+        GPIO.output(BUZZER_PIN, True); time.sleep(0.8); GPIO.output(BUZZER_PIN, False)
+    elif pattern == 'alarm':
+        for _ in range(3):
+            GPIO.output(BUZZER_PIN, True); time.sleep(0.15); GPIO.output(BUZZER_PIN, False); time.sleep(0.15)
+
+def immediate_rule_check(feat, sos_pressed):
+    # SOS button
+    if sos_pressed:
+        return True, 'SOS button pressed'
+    # Gas immediate critical
+    if feat['mq7'] >= THR['mq7_critical'] or feat['mq4'] >= THR['mq4_critical'] or feat['mq136'] >= THR['mq136_critical']:
+        return True, 'Gas levels critical'
+    # accel spike
+    if feat['accel_rms'] >= THR['accel_spike']:
+        return True, 'Microseismic spike'
+    # temperature extremes
+    if feat['temperature'] >= THR['temp_high'] or feat['temperature'] <= THR['temp_low']:
+        return True, 'Temperature out of safety range'
+    return False, ''
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--model', default='model.joblib')
+    p.add_argument('--dht-pin', default=4, type=int)
+    p.add_argument('--interval', default=2.0, type=float)
+    args = p.parse_args()
+
+    # Load model
+    try:
+        pack = joblib.load(args.model)
+        model = pack.get('model')
+        features = pack.get('features', [])
+        print("Loaded model with features:", features)
+    except Exception as e:
+        print("Model load failed:", e)
+        model = None
+        features = []
+
+    # Setup hardware
+    setup_gpio()
+    mpu = None
+    try:
+        mpu = MPU6050()
+    except Exception as e:
+        print("MPU init failed (simulated):", e)
+        mpu = None
+
+    lora = LoRaComm(dev_id='dev123')
+    bb = Blackbox()
+
+    # stats for fallback
+    hist = {f: [] for f in features} if features else {}
+
+    try:
+        while True:
+            sos_pressed = (GPIO.input(SOS_BUTTON_PIN) == GPIO.LOW)
+            feat = build_feature_vector(args.dht_pin, mpu, analog_reader=analog_reader_sim)
+            # priority immediate rules
+            immediate, reason = immediate_rule_check(feat, sos_pressed)
+            score = None
+            level = None
+
+            if immediate:
+                # immediate critical override
+                level = 'CRITICAL' if ('critical' in reason.lower() or sos_pressed) else 'HIGHRISK'
+                score = -999.0
+                print("Immediate rule triggered:", reason)
+            else:
+                if model is not None and features:
+                    x = np.array([feat.get(f, 0.0) for f in features]).reshape(1, -1)
+                    try:
+                        score = float(model.decision_function(x)[0])
+                        level = map_score_to_level(score)
+                    except Exception as e:
+                        print("Model inference failure:", e)
+                        score = None
+                else:
+                    # fallback: compute simple composite zscore or heuristic
+                    # very simple heuristic: combine normalized gas & accel
+                    gas = (feat['mq4'] + feat['mq7'] + feat['mq136']) / 3.0
+                    accel = feat['accel_rms']
+                    # scaled risk metric between 0..1
+                    risk = min(1.0, (gas/300.0) + (accel/0.05))
+                    if risk < 0.2:
+                        level = 'SAFE'
+                    elif risk < 0.5:
+                        level = 'CAUTION'
+                    elif risk < 0.8:
+                        level = 'HIGHRISK'
+                    else:
+                        level = 'CRITICAL'
+                    score = risk
+
+            # log
+            bb.append(level, score, feat, gps_lat=None, gps_lon=None, reason=reason or '')
+            print(time.strftime('%Y-%m-%d %H:%M:%S'), level, score, reason, feat)
+
+            # outputs
+            if level == 'SAFE':
+                beep('short')
+            elif level == 'CAUTION':
+                beep('short'); time.sleep(0.1)
+            elif level == 'HIGHRISK':
+                beep('alarm')
+            elif level == 'CRITICAL':
+                # loud and repeated and transmit emergency via LoRa
+                for _ in range(3):
+                    beep('long')
+                    time.sleep(0.1)
+                # send LoRa emergency
+                gps = {'lat': None, 'lon': None}  # integrate GPS reading if available
+                lora.send(level, reason or 'anomaly', lat=gps['lat'], lon=gps['lon'], score=score)
+            # sleep
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("Stopping monitor")
+    finally:
+        GPIO.cleanup()
+
+if __name__ == '__main__':
+    main()
