@@ -1,0 +1,45 @@
+const int potPin = 34;
+
+const int greenPin = 18;
+const int yellowPin = 19;
+const int redPin = 21;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(greenPin, OUTPUT);
+  pinMode(yellowPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+}
+
+void loop() {
+  int potValue = analogRead(potPin);
+
+  Serial.print("Potentiometer Value: ");
+  Serial.println(potValue);
+
+  // Turn all LEDs OFF
+  digitalWrite(greenPin, LOW);
+  digitalWrite(yellowPin, LOW);
+  digitalWrite(redPin, LOW);
+
+  // Select LED according to potentiometer value
+  int selectedPin;
+
+  if (potValue <= 819) {
+    selectedPin = greenPin;
+  }
+  else if (potValue <= 2047) {
+    selectedPin = yellowPin;
+  }
+  else {
+    selectedPin = redPin;
+  }
+
+  // Blink selected LED
+  digitalWrite(selectedPin, HIGH);
+  delay(500);
+
+  digitalWrite(selectedPin, LOW);
+  delay(500);
+}
