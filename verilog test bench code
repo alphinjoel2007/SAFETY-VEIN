@@ -1,0 +1,127 @@
+module safety_vein_tb;
+
+    reg clk;
+    reg rst;
+
+    reg [11:0] methane;
+    reg [11:0] co;
+    reg [11:0] h2s;
+    reg [11:0] temperature;
+    reg [11:0] humidity;
+
+    reg fall_detected;
+    reg impact_detected;
+    reg vital_abnormal;
+    reg sos_button;
+
+    wire [1:0] risk_level;
+    wire warning;
+    wire emergency;
+    wire blackbox_trigger;
+    wire [2:0] hazard_type;
+
+    safety_vein DUT (
+        .clk(clk),
+        .rst(rst),
+        .methane(methane),
+        .co(co),
+        .h2s(h2s),
+        .temperature(temperature),
+        .humidity(humidity),
+        .fall_detected(fall_detected),
+        .impact_detected(impact_detected),
+        .vital_abnormal(vital_abnormal),
+        .sos_button(sos_button),
+        .risk_level(risk_level),
+        .warning(warning),
+        .emergency(emergency),
+        .blackbox_trigger(blackbox_trigger),
+        .hazard_type(hazard_type)
+    );
+
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    initial begin
+        rst = 1;
+
+        methane = 0;
+        co = 0;
+        h2s = 0;
+        temperature = 0;
+        humidity = 0;
+        fall_detected = 0;
+        impact_detected = 0;
+        vital_abnormal = 0;
+        sos_button = 0;
+
+        #20;
+
+        rst = 0;
+
+        methane = 100;
+        co = 100;
+        h2s = 20;
+        temperature = 300;
+
+        #20;
+
+        methane = 550;
+
+        #20;
+
+        methane = 750;
+
+        #20;
+
+        methane = 950;
+
+        #20;
+
+        methane = 100;
+        fall_detected = 1;
+
+        #20;
+
+        fall_detected = 0;
+        impact_detected = 1;
+
+        #20;
+
+        impact_detected = 0;
+        vital_abnormal = 1;
+
+        #20;
+
+        vital_abnormal = 0;
+        sos_button = 1;
+
+        #20;
+
+        sos_button = 0;
+
+        #20;
+
+        $finish;
+    end
+
+    initial begin
+        $monitor(
+            "Time=%0t | Methane=%d | CO=%d | H2S=%d | Temp=%d | Fall=%b | SOS=%b | Risk=%d | Warning=%b | Emergency=%b | Blackbox=%b",
+            $time,
+            methane,
+            co,
+            h2s,
+            temperature,
+            fall_detected,
+            sos_button,
+            risk_level,
+            warning,
+            emergency,
+            blackbox_trigger
+        );
+    end
+
+endmodule
